@@ -8,6 +8,9 @@ Env vars:
   STATE_PATH          (optional) default /var/lib/apple-refurb-monitor/seen.json
   HEARTBEAT_HOURS     (optional) default 24
   REGIONS             (optional) comma list of locale codes to override REGIONS list
+  TARGET_MEMORY_SIZES (optional) comma list of memory slugs to match,
+                      default "256gb,512gb" (Mac Studio M3 Ultra exclusive).
+                      Set to "128gb" to smoke-test against current 16" MBP M4 Max stock.
 """
 
 from __future__ import annotations
@@ -51,9 +54,15 @@ USER_AGENT = (
 BASE_URL = "https://www.apple.com"
 PATH = "/shop/refurbished/mac"
 
-# Target: Mac Studio with M3 Ultra (only Ultra goes to 256/512GB).
-TARGET_MODEL_SLUG = "macstudio"
-TARGET_MEMORY_SIZES = {"256gb", "512gb"}
+# Memory-only filter. 256GB and 512GB are exclusive to the M3 Ultra Mac Studio,
+# so matching purely on RAM is sufficient and avoids relying on the model slug.
+# Configurable via env: TARGET_MEMORY_SIZES="256gb,512gb"  (default).
+# Set to "128gb" temporarily to smoke-test against currently-listed 16" MBP M4 Max units.
+def _parse_memory_targets() -> set[str]:
+    raw = os.environ.get("TARGET_MEMORY_SIZES", "256gb,512gb")
+    return {v.strip().lower() for v in raw.split(",") if v.strip()}
+
+TARGET_MEMORY_SIZES = _parse_memory_targets()
 
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
 REGION_JITTER_SEC = (0.8, 2.5)
@@ -119,28 +128,20 @@ def _extract_json_array(text: str, key: str) -> list | None:
 
 
 def parse_listings(html: str, locale: str) -> list[dict]:
-    """Extract every Mac Studio tile from a refurb category page.
+    """Extract every refurb-mac tile whose memory size is in TARGET_MEMORY_SIZES.
 
-    Each item is tagged with a `tier`:
-      - "target": 256GB or 512GB RAM — fires an urgent alert.
-      - "fallback": any other Mac Studio — fires a normal alert so we never miss
-        one due to an unexpected memory-slug format from Apple.
+    Matches by structured `tsMemorySize` slug from the page's embedded tiles JSON.
+    No model filter — the only Macs that ship with 256GB/512GB RAM are M3 Ultra
+    Mac Studios, so filtering on memory alone is both sufficient and immune to
+    Apple changing model-slug conventions.
     """
     tiles = _extract_json_array(html, "tiles") or []
     matches: list[dict] = []
     for t in tiles:
         dims = (t.get("filters") or {}).get("dimensions") or {}
-        if dims.get("refurbClearModel", "").lower() != TARGET_MODEL_SLUG:
-            continue
         memory_slug = dims.get("tsMemorySize", "").lower()
-        title = t.get("title", "").strip()
-        # Belt-and-braces: also catch tier="target" if the title literally mentions
-        # 256GB or 512GB even if the memory slug is weird.
-        title_has_target_ram = bool(re.search(r"\b(256|512)\s*GB\b", title, re.IGNORECASE))
-        if memory_slug in TARGET_MEMORY_SIZES or title_has_target_ram:
-            tier = "target"
-        else:
-            tier = "fallback"
+        if memory_slug not in TARGET_MEMORY_SIZES:
+            continue
         url_path = t.get("productDetailsUrl", "")
         price_block = t.get("price") or {}
         prev = price_block.get("previousPrice") or {}
@@ -148,14 +149,14 @@ def parse_listings(html: str, locale: str) -> list[dict]:
         if prev.get("raw_amount"):
             price_str = f"{price_block.get('priceCurrency', '')} {prev['raw_amount']}".strip()
         matches.append({
-            "tier": tier,
-            "title": title,
+            "title": t.get("title", "").strip(),
             "url": urljoin(BASE_URL, url_path) if url_path else "",
             "locale": locale,
             "price": price_str,
             "part_number": t.get("partNumber", ""),
             "memory": memory_slug,
             "storage": dims.get("dimensionCapacity", ""),
+            "model": dims.get("refurbClearModel", ""),
         })
     return matches
 
@@ -215,7 +216,6 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
             key = f"{locale}:{key}"
             if key in state["seen"]:
                 continue
-            tier = item.get("tier", "fallback")
             state["seen"][key] = {
                 "first_seen": int(time.time()),
                 "title": item["title"],
@@ -223,30 +223,22 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
                 "price": item.get("price", ""),
                 "memory": item.get("memory", ""),
                 "storage": item.get("storage", ""),
+                "model": item.get("model", ""),
                 "url": item["url"],
-                "tier": tier,
             }
             new_matches += 1
             mem = item.get("memory", "").upper() or "?"
             stor = item.get("storage", "").upper()
             spec_suffix = f"\nRAM: {mem}  SSD: {stor}" if stor else f"\nRAM: {mem}"
             price_suffix = f"\nPrice: {item['price']}" if item.get("price") else ""
-            if tier == "target":
-                title_prefix = f"[TARGET] Mac Studio {mem}"
-                priority = "urgent"
-                tags = ["rotating_light", "shopping_cart"]
-            else:
-                title_prefix = f"Mac Studio {mem} (fallback)"
-                priority = "default"
-                tags = ["eyes", "shopping_cart"]
             send_ntfy(
-                title=f"{title_prefix} - {name}",
+                title=f"MATCH {mem} - {name}",
                 message=f"{item['title']}{spec_suffix}{price_suffix}\n{item['url']}",
-                priority=priority,
+                priority="urgent",
                 click=item["url"],
-                tags=tags,
+                tags=["rotating_light", "shopping_cart"],
             )
-            print(f"[{tier.upper()}] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
+            print(f"[MATCH] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
         time.sleep(random.uniform(*REGION_JITTER_SEC))
     return new_matches
 
@@ -265,7 +257,7 @@ def main() -> int:
     print(f"started; polling {len(regions)} regions every ~{POLL_INTERVAL_SEC}s", flush=True)
     send_ntfy(
         "Apple refurb monitor started",
-        f"Watching {len(regions)} European storefronts for Mac Studio Ultra 256GB/512GB.",
+        f"Watching {len(regions)} EU storefronts for memory sizes: {sorted(TARGET_MEMORY_SIZES)}.",
         priority="low",
         tags=["white_check_mark"],
     )
