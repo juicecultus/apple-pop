@@ -54,15 +54,40 @@ USER_AGENT = (
 BASE_URL = "https://www.apple.com"
 PATH = "/shop/refurbished/mac"
 
-# Memory-only filter. 256GB and 512GB are exclusive to the M3 Ultra Mac Studio,
-# so matching purely on RAM is sufficient and avoids relying on the model slug.
-# Configurable via env: TARGET_MEMORY_SIZES="256gb,512gb"  (default).
-# Set to "128gb" temporarily to smoke-test against currently-listed 16" MBP M4 Max units.
+# Two-tier matching:
+#   tier="target"  -> urgent alert. memory slug in TARGET_MEMORY_SIZES.
+#   tier="hedge"   -> default-priority alert. refurbClearModel == HEDGE_MODEL_SLUG
+#                     AND parsed memory >= HEDGE_MIN_GB. Safety net for high-RAM
+#                     Mac Studios in case Apple uses an unexpected slug format
+#                     (256gb/512gb have never been observed in any EU refurb
+#                     store, so the exact slug is unverified).
 def _parse_memory_targets() -> set[str]:
     raw = os.environ.get("TARGET_MEMORY_SIZES", "256gb,512gb")
     return {v.strip().lower() for v in raw.split(",") if v.strip()}
 
 TARGET_MEMORY_SIZES = _parse_memory_targets()
+HEDGE_MODEL_SLUG = os.environ.get("HEDGE_MODEL_SLUG", "macstudio").lower()
+HEDGE_MIN_GB = int(os.environ.get("HEDGE_MIN_GB", "96"))
+
+
+def _memory_slug_to_gb(slug: str) -> int | None:
+    """Convert Apple's memory-size slug to GB. Returns None if unparseable.
+
+    Examples: "16gb"->16, "192gb"->192, "1_5tb"->1536, "2tb"->2048.
+    """
+    s = (slug or "").strip().lower()
+    if not s:
+        return None
+    m = re.fullmatch(r"(\d+)(?:_(\d+))?(gb|tb)", s)
+    if not m:
+        return None
+    whole, frac, unit = m.group(1), m.group(2), m.group(3)
+    value = float(whole)
+    if frac:
+        value += float(f"0.{frac}")
+    if unit == "tb":
+        value *= 1024
+    return int(value)
 
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
 REGION_JITTER_SEC = (0.8, 2.5)
@@ -140,8 +165,17 @@ def parse_listings(html: str, locale: str) -> list[dict]:
     for t in tiles:
         dims = (t.get("filters") or {}).get("dimensions") or {}
         memory_slug = dims.get("tsMemorySize", "").lower()
-        if memory_slug not in TARGET_MEMORY_SIZES:
-            continue
+        model_slug = dims.get("refurbClearModel", "").lower()
+        if memory_slug in TARGET_MEMORY_SIZES:
+            tier = "target"
+        else:
+            mem_gb = _memory_slug_to_gb(memory_slug)
+            if (model_slug == HEDGE_MODEL_SLUG
+                    and mem_gb is not None
+                    and mem_gb >= HEDGE_MIN_GB):
+                tier = "hedge"
+            else:
+                continue
         url_path = t.get("productDetailsUrl", "")
         price_block = t.get("price") or {}
         # Try currentPrice.amount first (already formatted with currency symbol);
@@ -159,6 +193,7 @@ def parse_listings(html: str, locale: str) -> list[dict]:
         elif prev.get("raw_amount"):
             price_str = f"{price_block.get('priceCurrency', '')} {prev['raw_amount']}".strip()
         matches.append({
+            "tier": tier,
             "title": t.get("title", "").strip(),
             "url": urljoin(BASE_URL, url_path) if url_path else "",
             "locale": locale,
@@ -226,6 +261,7 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
             key = f"{locale}:{key}"
             if key in state["seen"]:
                 continue
+            tier = item.get("tier", "target")
             state["seen"][key] = {
                 "first_seen": int(time.time()),
                 "title": item["title"],
@@ -235,20 +271,29 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
                 "storage": item.get("storage", ""),
                 "model": item.get("model", ""),
                 "url": item["url"],
+                "tier": tier,
             }
             new_matches += 1
             mem = item.get("memory", "").upper() or "?"
             stor = item.get("storage", "").upper()
             spec_suffix = f"\nRAM: {mem}  SSD: {stor}" if stor else f"\nRAM: {mem}"
             price_suffix = f"\nPrice: {item['price']}" if item.get("price") else ""
+            if tier == "target":
+                push_title = f"MATCH {mem} - {name}"
+                priority = "urgent"
+                tags = ["rotating_light", "shopping_cart"]
+            else:
+                push_title = f"Studio hedge {mem} - {name}"
+                priority = "default"
+                tags = ["eyes", "shopping_cart"]
             send_ntfy(
-                title=f"MATCH {mem} - {name}",
+                title=push_title,
                 message=f"{item['title']}{spec_suffix}{price_suffix}\n{item['url']}",
-                priority="urgent",
+                priority=priority,
                 click=item["url"],
-                tags=["rotating_light", "shopping_cart"],
+                tags=tags,
             )
-            print(f"[MATCH] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
+            print(f"[{tier.upper()}] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
         time.sleep(random.uniform(*REGION_JITTER_SEC))
     return new_matches
 
