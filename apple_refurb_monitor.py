@@ -144,9 +144,19 @@ def parse_listings(html: str, locale: str) -> list[dict]:
             continue
         url_path = t.get("productDetailsUrl", "")
         price_block = t.get("price") or {}
-        prev = price_block.get("previousPrice") or {}
+        # Try currentPrice.amount first (already formatted with currency symbol);
+        # fall back to previousPrice.raw_amount for items with a was-price; finally
+        # fall back to a bare raw_amount + currency code.
         price_str = ""
-        if prev.get("raw_amount"):
+        cur = price_block.get("currentPrice") or {}
+        prev = price_block.get("previousPrice") or {}
+        if cur.get("amount"):
+            price_str = cur["amount"]
+        elif prev.get("amount"):
+            price_str = prev["amount"]
+        elif cur.get("raw_amount"):
+            price_str = f"{price_block.get('priceCurrency', '')} {cur['raw_amount']}".strip()
+        elif prev.get("raw_amount"):
             price_str = f"{price_block.get('priceCurrency', '')} {prev['raw_amount']}".strip()
         matches.append({
             "title": t.get("title", "").strip(),
