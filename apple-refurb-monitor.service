@@ -1,0 +1,28 @@
+[Unit]
+Description=Apple Refurb Monitor (Mac Studio Ultra 256/512GB across Europe)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=justin
+Group=justin
+EnvironmentFile=/etc/apple-refurb-monitor.env
+WorkingDirectory=/opt/apple-refurb-monitor
+ExecStart=/opt/apple-refurb-monitor/venv/bin/python /opt/apple-refurb-monitor/apple_refurb_monitor.py
+Restart=on-failure
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+
+# Filesystem hardening
+StateDirectory=apple-refurb-monitor
+StateDirectoryMode=0750
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+NoNewPrivileges=true
+ReadWritePaths=/var/lib/apple-refurb-monitor
+
+[Install]
+WantedBy=multi-user.target
