@@ -119,15 +119,28 @@ def _extract_json_array(text: str, key: str) -> list | None:
 
 
 def parse_listings(html: str, locale: str) -> list[dict]:
-    """Extract Mac Studio Ultra (256/512GB) tiles from a refurb category page."""
+    """Extract every Mac Studio tile from a refurb category page.
+
+    Each item is tagged with a `tier`:
+      - "target": 256GB or 512GB RAM — fires an urgent alert.
+      - "fallback": any other Mac Studio — fires a normal alert so we never miss
+        one due to an unexpected memory-slug format from Apple.
+    """
     tiles = _extract_json_array(html, "tiles") or []
     matches: list[dict] = []
     for t in tiles:
         dims = (t.get("filters") or {}).get("dimensions") or {}
         if dims.get("refurbClearModel", "").lower() != TARGET_MODEL_SLUG:
             continue
-        if dims.get("tsMemorySize", "").lower() not in TARGET_MEMORY_SIZES:
-            continue
+        memory_slug = dims.get("tsMemorySize", "").lower()
+        title = t.get("title", "").strip()
+        # Belt-and-braces: also catch tier="target" if the title literally mentions
+        # 256GB or 512GB even if the memory slug is weird.
+        title_has_target_ram = bool(re.search(r"\b(256|512)\s*GB\b", title, re.IGNORECASE))
+        if memory_slug in TARGET_MEMORY_SIZES or title_has_target_ram:
+            tier = "target"
+        else:
+            tier = "fallback"
         url_path = t.get("productDetailsUrl", "")
         price_block = t.get("price") or {}
         prev = price_block.get("previousPrice") or {}
@@ -135,12 +148,13 @@ def parse_listings(html: str, locale: str) -> list[dict]:
         if prev.get("raw_amount"):
             price_str = f"{price_block.get('priceCurrency', '')} {prev['raw_amount']}".strip()
         matches.append({
-            "title": t.get("title", "").strip(),
+            "tier": tier,
+            "title": title,
             "url": urljoin(BASE_URL, url_path) if url_path else "",
             "locale": locale,
             "price": price_str,
             "part_number": t.get("partNumber", ""),
-            "memory": dims.get("tsMemorySize", ""),
+            "memory": memory_slug,
             "storage": dims.get("dimensionCapacity", ""),
         })
     return matches
@@ -201,6 +215,7 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
             key = f"{locale}:{key}"
             if key in state["seen"]:
                 continue
+            tier = item.get("tier", "fallback")
             state["seen"][key] = {
                 "first_seen": int(time.time()),
                 "title": item["title"],
@@ -209,20 +224,29 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
                 "memory": item.get("memory", ""),
                 "storage": item.get("storage", ""),
                 "url": item["url"],
+                "tier": tier,
             }
             new_matches += 1
-            mem = item.get("memory", "").upper()
+            mem = item.get("memory", "").upper() or "?"
             stor = item.get("storage", "").upper()
-            spec_suffix = f"\nRAM: {mem}  SSD: {stor}" if mem else ""
+            spec_suffix = f"\nRAM: {mem}  SSD: {stor}" if stor else f"\nRAM: {mem}"
             price_suffix = f"\nPrice: {item['price']}" if item.get("price") else ""
+            if tier == "target":
+                title_prefix = f"[TARGET] Mac Studio {mem}"
+                priority = "urgent"
+                tags = ["rotating_light", "shopping_cart"]
+            else:
+                title_prefix = f"Mac Studio {mem} (fallback)"
+                priority = "default"
+                tags = ["eyes", "shopping_cart"]
             send_ntfy(
-                title=f"Mac Studio Ultra {mem} available - {name}",
+                title=f"{title_prefix} - {name}",
                 message=f"{item['title']}{spec_suffix}{price_suffix}\n{item['url']}",
-                priority="urgent",
+                priority=priority,
                 click=item["url"],
-                tags=["rotating_light", "shopping_cart"],
+                tags=tags,
             )
-            print(f"[MATCH] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
+            print(f"[{tier.upper()}] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
         time.sleep(random.uniform(*REGION_JITTER_SEC))
     return new_matches
 

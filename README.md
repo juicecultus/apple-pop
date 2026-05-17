@@ -21,9 +21,13 @@ title, deep URL, price, and **structured `filters.dimensions`** including `refur
 (e.g. `macstudio`) and `tsMemorySize` (e.g. `256gb`). We match on those structured fields,
 so it works across all locales — no fragile title-string parsing in German/French/etc.
 
-256GB and 512GB RAM are only offered on the **M3 Ultra Mac Studio**, so the memory filter
-alone implies "Ultra" — but matching also requires `refurbClearModel == "macstudio"` for
-safety.
+### Two-tier alerts
+- **`tier=target` (urgent priority)** — Mac Studio with 256GB or 512GB RAM. Fires on either
+  the structured memory slug *or* a title regex matching "256GB"/"512GB" as a defence
+  against unexpected slug formats.
+- **`tier=fallback` (default priority)** — *any other* Mac Studio refurb (e.g. 64GB M4 Max).
+  Safety net so we never miss a high-RAM unit due to Apple changing slug conventions, and
+  it surfaces every Studio so you can eyeball anything close to the target.
 
 ## Pick an ntfy topic
 ntfy topics are public-but-unguessable. Pick something long and random (anyone with the
