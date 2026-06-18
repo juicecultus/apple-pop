@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor Apple refurbished stores across Europe for Mac Studio Ultra with 256GB/512GB RAM.
+"""Monitor Apple refurbished stores across the US, Canada and Europe for Mac Studio Ultra with 256GB/512GB RAM.
 
 Env vars:
   NTFY_TOPIC          (required for alerts) ntfy.sh topic name, e.g. "justin-apple-refurb-x7k2"
@@ -343,7 +343,7 @@ def main() -> int:
     print(f"started; polling {len(regions)} regions every ~{POLL_INTERVAL_SEC}s", flush=True)
     send_ntfy(
         "Apple refurb monitor started",
-        f"Watching {len(regions)} EU storefronts for memory sizes: {sorted(TARGET_MEMORY_SIZES)}.",
+        f"Watching {len(regions)} storefronts (US, Canada + Europe) for memory sizes: {sorted(TARGET_MEMORY_SIZES)}.",
         priority="low",
         tags=["white_check_mark"],
     )
