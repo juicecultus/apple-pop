@@ -30,8 +30,12 @@ import requests
 # If Apple returns 404 for a locale (e.g. country removed from refurb program),
 # it is silently skipped.
 DEFAULT_REGIONS: list[tuple[str, str]] = [
-    # Confirmed live Apple refurb storefronts in Europe (as of 2026-05).
+    # Confirmed live Apple refurb storefronts (as of 2026-06).
     # Any returning 404 will be silently skipped.
+    # North America
+    ("us", "United States"),
+    ("ca", "Canada"),
+    # Europe
     ("uk", "United Kingdom"),
     ("de", "Germany"),
     ("fr", "France"),
