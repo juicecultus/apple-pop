@@ -94,11 +94,17 @@ def _memory_slug_to_gb(slug: str) -> int | None:
     return int(value)
 
 POLL_INTERVAL_SEC = int(os.environ.get("POLL_INTERVAL_SEC", "60"))
-REGION_JITTER_SEC = (0.8, 2.5)
+REGION_JITTER_SEC = (1.5, 4.0)  # spacing between regions, to avoid bursting Apple
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 STATE_PATH = Path(os.environ.get("STATE_PATH", "/var/lib/apple-refurb-monitor/seen.json"))
 HEARTBEAT_HOURS = float(os.environ.get("HEARTBEAT_HOURS", "24"))
+
+# Per-request resilience against Apple's intermittent 5xx / read timeouts.
+FETCH_CONNECT_TIMEOUT = float(os.environ.get("FETCH_CONNECT_TIMEOUT", "10"))
+FETCH_READ_TIMEOUT = float(os.environ.get("FETCH_READ_TIMEOUT", "30"))
+FETCH_MAX_ATTEMPTS = int(os.environ.get("FETCH_MAX_ATTEMPTS", "3"))
+FETCH_BACKOFF_BASE_SEC = float(os.environ.get("FETCH_BACKOFF_BASE_SEC", "2.0"))
 
 def get_regions() -> list[tuple[str, str]]:
     override = os.environ.get("REGIONS", "").strip()
@@ -109,16 +115,37 @@ def get_regions() -> list[tuple[str, str]]:
 
 
 def fetch_region(session: requests.Session, locale: str) -> str | None:
+    """Fetch a locale's refurb page, retrying transient failures with backoff.
+
+    404/410 (locale not in the refurb program) are permanent -> return None
+    immediately, no retry. 5xx, read timeouts, and connection errors are
+    transient (Apple rate-limiting) -> retry up to FETCH_MAX_ATTEMPTS with
+    exponential backoff + jitter. Returns None only after exhausting attempts,
+    so a single bad cycle never permanently drops a region.
+    """
     url = f"{BASE_URL}/{locale}{PATH}"
-    try:
-        r = session.get(url, timeout=20)
-        if r.status_code in (404, 410):
-            return None
-        r.raise_for_status()
-        return r.text
-    except requests.RequestException as e:
-        print(f"[warn] {locale}: {e}", file=sys.stderr, flush=True)
-        return None
+    timeout = (FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT)
+    last_err = ""
+    for attempt in range(1, FETCH_MAX_ATTEMPTS + 1):
+        try:
+            r = session.get(url, timeout=timeout)
+            if r.status_code in (404, 410):
+                return None  # permanent: locale not offered
+            if r.status_code >= 500:
+                last_err = f"{r.status_code} Server Error"
+                raise requests.HTTPError(last_err)
+            r.raise_for_status()
+            return r.text
+        except requests.RequestException as e:
+            last_err = str(e) or type(e).__name__
+            if attempt < FETCH_MAX_ATTEMPTS:
+                # exponential backoff with jitter: base*2^(n-1) +/- up to base/2
+                delay = FETCH_BACKOFF_BASE_SEC * (2 ** (attempt - 1))
+                delay += random.uniform(0, FETCH_BACKOFF_BASE_SEC)
+                time.sleep(delay)
+    print(f"[warn] {locale}: failed after {FETCH_MAX_ATTEMPTS} attempts: {last_err}",
+          file=sys.stderr, flush=True)
+    return None
 
 
 def _extract_json_array(text: str, key: str) -> list | None:
