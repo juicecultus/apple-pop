@@ -184,29 +184,44 @@ def _extract_json_array(text: str, key: str) -> list | None:
 
 
 def parse_listings(html: str, locale: str) -> list[dict]:
-    """Extract every refurb-mac tile whose memory size is in TARGET_MEMORY_SIZES.
+    """Extract refurb-mac tiles that warrant an alert, with a tier per item.
 
-    Matches by structured `tsMemorySize` slug from the page's embedded tiles JSON.
-    No model filter — the only Macs that ship with 256GB/512GB RAM are M3 Ultra
-    Mac Studios, so filtering on memory alone is both sufficient and immune to
-    Apple changing model-slug conventions.
+    Two kinds of tile carry the memory we care about:
+      1. Fixed-config tiles expose `filters.dimensions.tsMemorySize` (e.g. "512gb").
+      2. CONFIGURABLE tiles (high-end M3 Ultra Mac Studios) omit tsMemorySize
+         entirely — the category tile shows only a base price and you pick the
+         memory on the product page (96/256/512GB). These have NO memory slug,
+         so memory-only matching silently misses them. This was the bug that
+         let a 512GB M3 Ultra slip through.
+
+    Tiers:
+      - "target" (urgent): tile memory slug is in TARGET_MEMORY_SIZES, OR it's a
+        Mac Studio that is Ultra / configurable (memory hidden) — because those
+        can be bought at 256/512GB. `configurable` items are flagged so the
+        caller can enrich the alert with the real options from the product page.
+      - "hedge" (default): any other Mac Studio with parseable RAM >= HEDGE_MIN_GB.
     """
     tiles = _extract_json_array(html, "tiles") or []
     matches: list[dict] = []
     for t in tiles:
         dims = (t.get("filters") or {}).get("dimensions") or {}
-        memory_slug = dims.get("tsMemorySize", "").lower()
-        model_slug = dims.get("refurbClearModel", "").lower()
+        # dimensions values can be missing OR explicitly null -> coerce to "".
+        memory_slug = (dims.get("tsMemorySize") or "").lower()
+        model_slug = (dims.get("refurbClearModel") or "").lower()
+        title = t.get("title", "").strip()
+        is_studio = model_slug == HEDGE_MODEL_SLUG
+        is_ultra = "ultra" in title.lower()
+        configurable = is_studio and not memory_slug  # studio tile with hidden memory
+        mem_gb = _memory_slug_to_gb(memory_slug)
         if memory_slug in TARGET_MEMORY_SIZES:
             tier = "target"
+        elif is_studio and (is_ultra or configurable):
+            # Ultra / configurable Studios can be 256-512GB -> never miss them.
+            tier = "target"
+        elif is_studio and mem_gb is not None and mem_gb >= HEDGE_MIN_GB:
+            tier = "hedge"
         else:
-            mem_gb = _memory_slug_to_gb(memory_slug)
-            if (model_slug == HEDGE_MODEL_SLUG
-                    and mem_gb is not None
-                    and mem_gb >= HEDGE_MIN_GB):
-                tier = "hedge"
-            else:
-                continue
+            continue
         url_path = t.get("productDetailsUrl", "")
         price_block = t.get("price") or {}
         # Try currentPrice.amount first (already formatted with currency symbol);
@@ -225,16 +240,52 @@ def parse_listings(html: str, locale: str) -> list[dict]:
             price_str = f"{price_block.get('priceCurrency', '')} {prev['raw_amount']}".strip()
         matches.append({
             "tier": tier,
-            "title": t.get("title", "").strip(),
+            "title": title,
             "url": urljoin(BASE_URL, url_path) if url_path else "",
             "locale": locale,
             "price": price_str,
             "part_number": t.get("partNumber", ""),
             "memory": memory_slug,
-            "storage": dims.get("dimensionCapacity", ""),
-            "model": dims.get("refurbClearModel", ""),
+            "storage": (dims.get("dimensionCapacity") or ""),
+            "model": model_slug,
+            "configurable": configurable,
         })
     return matches
+
+
+_OPTION_MEM_RE = re.compile(r'<option[^>]*\bvalue="(\d+(?:_\d+)?(?:gb|tb))"', re.IGNORECASE)
+
+
+def fetch_product_memory_options(session: requests.Session, url: str) -> list[str]:
+    """Best-effort: read a configurable product page and return its memory option
+    slugs (e.g. ["96gb","256gb","512gb"]). Returns [] on any failure — callers
+    must NOT gate the alert on this; it only enriches the message.
+    """
+    if not url:
+        return []
+    try:
+        r = session.get(url, timeout=(FETCH_CONNECT_TIMEOUT, FETCH_READ_TIMEOUT))
+        if r.status_code != 200:
+            return []
+        # Scope strictly to the memory <select> so storage (TB) options don't
+        # leak in. The memory select is labelled "dimensionMemory"; read only up
+        # to the next </select>.
+        html = r.text
+        start = html.find("dimensionMemory")
+        if start < 0:
+            return []
+        end = html.find("</select>", start)
+        scope = html[start:end] if end >= 0 else html[start:start + 4000]
+        opts = [m.lower() for m in _OPTION_MEM_RE.findall(scope)]
+        # de-dupe preserving order
+        seen, out = set(), []
+        for o in opts:
+            if o not in seen:
+                seen.add(o)
+                out.append(o)
+        return out
+    except requests.RequestException:
+        return []
 
 
 def load_state() -> dict:
@@ -293,6 +344,11 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
             if key in state["seen"]:
                 continue
             tier = item.get("tier", "target")
+            # Configurable Studios hide memory on the tile; read the real options
+            # from the product page (best-effort) so the alert is specific.
+            options: list[str] = []
+            if item.get("configurable"):
+                options = fetch_product_memory_options(session, item["url"])
             state["seen"][key] = {
                 "first_seen": int(time.time()),
                 "title": item["title"],
@@ -303,18 +359,29 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
                 "model": item.get("model", ""),
                 "url": item["url"],
                 "tier": tier,
+                "configurable": item.get("configurable", False),
+                "memory_options": options,
             }
             new_matches += 1
-            mem = item.get("memory", "").upper() or "?"
             stor = item.get("storage", "").upper()
-            spec_suffix = f"\nRAM: {mem}  SSD: {stor}" if stor else f"\nRAM: {mem}"
-            price_suffix = f"\nPrice: {item['price']}" if item.get("price") else ""
+            if item.get("configurable"):
+                if options:
+                    opts_up = "/".join(o.upper().replace("_", ".") for o in options)
+                    mem_label = f"configurable: {opts_up}"
+                else:
+                    mem_label = "configurable (up to 512GB)"
+            else:
+                mem_label = item.get("memory", "").upper() or "?"
+            spec_suffix = f"\nRAM: {mem_label}"
+            if stor and not item.get("configurable"):
+                spec_suffix += f"  SSD: {stor}"
+            price_suffix = f"\nFrom: {item['price']}" if item.get("price") else ""
             if tier == "target":
-                push_title = f"MATCH {mem} - {name}"
+                push_title = f"MAC STUDIO ULTRA - {name}"
                 priority = "urgent"
                 tags = ["rotating_light", "shopping_cart"]
             else:
-                push_title = f"Studio hedge {mem} - {name}"
+                push_title = f"Studio hedge {mem_label} - {name}"
                 priority = "default"
                 tags = ["eyes", "shopping_cart"]
             send_ntfy(
@@ -324,7 +391,7 @@ def run_once(session: requests.Session, regions: list[tuple[str, str]], state: d
                 click=item["url"],
                 tags=tags,
             )
-            print(f"[{tier.upper()}] {name}: {item['title']} ({mem}) -> {item['url']}", flush=True)
+            print(f"[{tier.upper()}] {name}: {item['title']} ({mem_label}) -> {item['url']}", flush=True)
         time.sleep(random.uniform(*REGION_JITTER_SEC))
     return new_matches
 
