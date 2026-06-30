@@ -72,6 +72,10 @@ def _parse_memory_targets() -> set[str]:
 TARGET_MEMORY_SIZES = _parse_memory_targets()
 HEDGE_MODEL_SLUG = os.environ.get("HEDGE_MODEL_SLUG", "macstudio").lower()
 HEDGE_MIN_GB = int(os.environ.get("HEDGE_MIN_GB", "96"))
+# A Mac Studio with >= this much RAM fires an URGENT (target) alert, even if its
+# memory isn't 256/512. Default 128 catches the maxed-out M4 Max Studio. Scoped
+# to Mac Studio only, so 128GB MacBook Pros do NOT flood urgent alerts.
+STUDIO_URGENT_MIN_GB = int(os.environ.get("STUDIO_URGENT_MIN_GB", "128"))
 
 
 def _memory_slug_to_gb(slug: str) -> int | None:
@@ -194,12 +198,19 @@ def parse_listings(html: str, locale: str) -> list[dict]:
          so memory-only matching silently misses them. This was the bug that
          let a 512GB M3 Ultra slip through.
 
-    Tiers:
-      - "target" (urgent): tile memory slug is in TARGET_MEMORY_SIZES, OR it's a
-        Mac Studio that is Ultra / configurable (memory hidden) — because those
-        can be bought at 256/512GB. `configurable` items are flagged so the
-        caller can enrich the alert with the real options from the product page.
-      - "hedge" (default): any other Mac Studio with parseable RAM >= HEDGE_MIN_GB.
+    Tiers (Mac Studio is the only model with model-scoped rules):
+      - "target" (urgent):
+          * any model whose memory slug is in TARGET_MEMORY_SIZES (256/512), OR
+          * a Mac Studio whose memory can't be read from the tile (null or
+            unparseable slug) — configurable Ultras hide memory and can be
+            256/512GB, so never miss them; flagged `configurable` for product-
+            page enrichment, OR
+          * a Mac Studio with parseable RAM >= STUDIO_URGENT_MIN_GB (default 128,
+            i.e. the maxed-out M4 Max Studio and every Ultra config).
+      - "hedge" (default): a Mac Studio with parseable RAM in [HEDGE_MIN_GB,
+        STUDIO_URGENT_MIN_GB) — e.g. a 96GB Studio.
+    Non-Studio Macs (MacBook Pro etc.) only ever alert via the 256/512 slug rule,
+    so 128GB MacBook Pros do NOT trigger urgent alerts.
     """
     tiles = _extract_json_array(html, "tiles") or []
     matches: list[dict] = []
@@ -210,13 +221,15 @@ def parse_listings(html: str, locale: str) -> list[dict]:
         model_slug = (dims.get("refurbClearModel") or "").lower()
         title = t.get("title", "").strip()
         is_studio = model_slug == HEDGE_MODEL_SLUG
-        is_ultra = "ultra" in title.lower()
-        configurable = is_studio and not memory_slug  # studio tile with hidden memory
         mem_gb = _memory_slug_to_gb(memory_slug)
+        # A Studio whose memory we can't determine from the tile (null OR an
+        # unparseable slug) -> treat as configurable: enrich + never miss.
+        configurable = is_studio and mem_gb is None
         if memory_slug in TARGET_MEMORY_SIZES:
             tier = "target"
-        elif is_studio and (is_ultra or configurable):
-            # Ultra / configurable Studios can be 256-512GB -> never miss them.
+        elif configurable:
+            tier = "target"
+        elif is_studio and mem_gb is not None and mem_gb >= STUDIO_URGENT_MIN_GB:
             tier = "target"
         elif is_studio and mem_gb is not None and mem_gb >= HEDGE_MIN_GB:
             tier = "hedge"
